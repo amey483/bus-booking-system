@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { busAPI, bookingAPI, offerAPI } from '../services/api';
+import { busAPI, bookingAPI, paymentAPI } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'react-toastify';
 import { IndianRupee, User, Calendar, MapPin, Clock, Tag, X } from 'lucide-react';
@@ -21,11 +21,8 @@ const BookingPage = () => {
     gender: 'Male',
     phone: user?.phone || ''
   });
-  const [offerCode, setOfferCode] = useState('');
-  const [appliedOffer, setAppliedOffer] = useState(null);
-  const [offerLoading, setOfferLoading] = useState(false);
   const [bookingLoading, setBookingLoading] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState('online'); // 'online' or 'cash'
+  const [paymentMethod, setPaymentMethod] = useState('online');
 
   const journeyDate = searchParams.get('date');
 
@@ -41,9 +38,38 @@ const BookingPage = () => {
   const fetchBusDetails = async () => {
     try {
       setLoading(true);
-      const response = await busAPI.getBusById(busId);
-      console.log('Bus details:', response.data);
-      setBus(response.data.bus || response.data);
+      
+      // ✅ Fetch bus details
+      const busResponse = await busAPI.getBusById(busId);
+      const busData = busResponse.data.bus || busResponse.data;
+      
+      // ✅ If we have a journey date, fetch date-specific seats
+      if (journeyDate) {
+        console.log('Fetching seats for date:', journeyDate);
+        try {
+          const seatsResponse = await fetch(
+            `http://localhost:5000/api/buses/${busId}/seats/${journeyDate}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${localStorage.getItem('token')}`
+              }
+            }
+          );
+          const seatsData = await seatsResponse.json();
+          
+          if (seatsData.success) {
+            console.log('Date-specific seats loaded:', seatsData);
+            // Update bus data with date-specific seat layout
+            busData.seatLayout = seatsData.seatLayout;
+            busData.availableSeats = seatsData.availableSeats;
+          }
+        } catch (seatError) {
+          console.error('Error fetching date-specific seats:', seatError);
+          // Fall back to regular seat layout
+        }
+      }
+      
+      setBus(busData);
     } catch (error) {
       console.error('Error fetching bus:', error);
       toast.error('Failed to load bus details');
@@ -74,39 +100,6 @@ const BookingPage = () => {
     });
   };
 
-  const handleApplyOffer = async () => {
-    if (!offerCode.trim()) {
-      toast.error('Please enter offer code');
-      return;
-    }
-
-    try {
-      setOfferLoading(true);
-      const baseAmount = selectedSeats.length * (bus.price || 0);
-      
-      const response = await offerAPI.validateOffer({
-        code: offerCode,
-        bookingAmount: baseAmount,
-        busId: busId,
-        route: { from: bus.from, to: bus.to }
-      });
-
-      setAppliedOffer(response.data);
-      toast.success('Offer applied successfully!');
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Invalid offer code');
-      setAppliedOffer(null);
-    } finally {
-      setOfferLoading(false);
-    }
-  };
-
-  const handleRemoveOffer = () => {
-    setAppliedOffer(null);
-    setOfferCode('');
-    toast.info('Offer removed');
-  };
-
   const handleBooking = async (e) => {
     e.preventDefault();
 
@@ -119,9 +112,6 @@ const BookingPage = () => {
       toast.error('Journey date is missing');
       return;
     }
-
-    console.log('Selected Seats:', selectedSeats);
-    console.log('Bus Seat Layout:', bus.seatLayout?.map(s => s.seatNumber));
 
     try {
       setBookingLoading(true);
@@ -136,30 +126,26 @@ const BookingPage = () => {
         paymentMethod: paymentMethod
       };
 
-      // Add offer if applied
-      if (appliedOffer) {
-        bookingData.offerApplied = {
-          code: appliedOffer.offer.code,
-          discount: appliedOffer.discount,
-          originalAmount: appliedOffer.originalAmount
-        };
-      }
+      console.log('Creating booking with data:', bookingData);
 
-      console.log('Booking Data:', bookingData);
-
+      // ✅ Create booking first
       const response = await bookingAPI.createBooking(bookingData);
       const booking = response.data.booking;
 
-      // If online payment selected, initiate Razorpay
+      console.log('Booking created:', booking);
+
+      // ✅ If online payment, initiate Razorpay
       if (paymentMethod === 'online') {
         await initiatePayment(booking);
       } else {
-        toast.success('Booking confirmed successfully!');
-        navigate('/my-bookings');
+        // Cash payment - booking is confirmed
+        toast.success('Booking confirmed! Pay at boarding point.');
+        setTimeout(() => navigate('/my-bookings'), 1500);
       }
     } catch (error) {
       const message = error.response?.data?.message || 'Booking failed';
       toast.error(message);
+      console.error('Booking error:', error);
     } finally {
       setBookingLoading(false);
     }
@@ -167,35 +153,38 @@ const BookingPage = () => {
 
   const initiatePayment = async (booking) => {
     try {
-      // Create Razorpay order
-      const orderResponse = await fetch('http://localhost:5000/api/payment/create-order', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
-        },
-        body: JSON.stringify({
-          amount: finalAmount,
-          bookingId: booking._id
-        })
+      console.log('Initiating payment for booking:', booking._id);
+
+      // ✅ Create Razorpay order
+      const orderResponse = await paymentAPI.createOrder({
+        amount: booking.totalAmount,
+        bookingId: booking._id
       });
 
-      const orderData = await orderResponse.json();
+      console.log('Payment order created:', orderResponse.data);
 
-      if (!orderData.success) {
+      if (!orderResponse.data.success) {
         throw new Error('Failed to create payment order');
       }
 
-      // Initialize Razorpay
+      const { order, razorpayKeyId } = orderResponse.data;
+
+      // ✅ Check if Razorpay is loaded
+      if (typeof window.Razorpay === 'undefined') {
+        toast.error('Payment system not loaded. Please refresh the page.');
+        return;
+      }
+
+      // ✅ Initialize Razorpay
       const options = {
-        key: 'rzp_test_RpTbT93jQSOuQk', 
-        amount: orderData.order.amount,
-        currency: 'INR',
+        key: razorpayKeyId,
+        amount: order.amount,
+        currency: order.currency,
         name: 'BusBooking',
         description: `Booking: ${booking.bookingId}`,
-        order_id: orderData.order.id,
+        order_id: order.id,
         handler: async function (response) {
-          // Payment successful
+          console.log('Payment successful:', response);
           await verifyPayment(response, booking._id);
         },
         prefill: {
@@ -208,48 +197,51 @@ const BookingPage = () => {
         },
         modal: {
           ondismiss: function() {
-            toast.warning('Payment cancelled. Booking saved but not confirmed.');
-            navigate('/my-bookings');
+            toast.warning('Payment cancelled. Your booking is saved but not confirmed.');
+            setTimeout(() => navigate('/my-bookings'), 1500);
           }
         }
       };
 
       const razorpay = new window.Razorpay(options);
       razorpay.open();
+
+      // Handle payment failure
+      razorpay.on('payment.failed', function (response) {
+        console.error('Payment failed:', response.error);
+        toast.error('Payment failed. Please try again.');
+        setTimeout(() => navigate('/my-bookings'), 1500);
+      });
+
     } catch (error) {
       console.error('Payment initiation error:', error);
-      toast.error('Payment initiation failed. Booking saved but not confirmed.');
-      navigate('/my-bookings');
+      toast.error('Failed to initiate payment. Booking saved.');
+      setTimeout(() => navigate('/my-bookings'), 1500);
     }
   };
 
   const verifyPayment = async (paymentResponse, bookingId) => {
     try {
-      const response = await fetch('http://localhost:5000/api/payment/verify', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
-        },
-        body: JSON.stringify({
-          razorpay_order_id: paymentResponse.razorpay_order_id,
-          razorpay_payment_id: paymentResponse.razorpay_payment_id,
-          razorpay_signature: paymentResponse.razorpay_signature,
-          bookingId: bookingId
-        })
+      console.log('Verifying payment:', paymentResponse);
+
+      const response = await paymentAPI.verifyPayment({
+        razorpay_order_id: paymentResponse.razorpay_order_id,
+        razorpay_payment_id: paymentResponse.razorpay_payment_id,
+        razorpay_signature: paymentResponse.razorpay_signature,
+        bookingId: bookingId
       });
 
-      const data = await response.json();
-
-      if (data.success) {
+      if (response.data.success) {
         toast.success('Payment successful! Booking confirmed.');
-        navigate('/my-bookings');
+        setTimeout(() => navigate('/my-bookings'), 1500);
       } else {
         toast.error('Payment verification failed');
+        setTimeout(() => navigate('/my-bookings'), 1500);
       }
     } catch (error) {
       console.error('Payment verification error:', error);
       toast.error('Payment verification failed');
+      setTimeout(() => navigate('/my-bookings'), 1500);
     }
   };
 
@@ -266,14 +258,12 @@ const BookingPage = () => {
   }
 
   const totalAmount = selectedSeats.length * (bus.price || 0);
-  const finalAmount = appliedOffer ? appliedOffer.finalAmount : totalAmount;
-  const discount = appliedOffer ? appliedOffer.discount : 0;
+  const finalAmount = totalAmount;
 
   // Create seat layout (10 rows x 4 columns)
   const rows = 10;
   const seatsPerRow = 4;
   
-  // Ensure we have seat layout data
   const seatLayout = [];
   if (bus.seatLayout && bus.seatLayout.length > 0) {
     for (let i = 0; i < rows; i++) {
@@ -283,7 +273,6 @@ const BookingPage = () => {
       }
     }
   } else {
-    // Fallback: create default seat layout if not available
     for (let i = 0; i < rows; i++) {
       const rowSeats = [];
       for (let j = 0; j < seatsPerRow; j++) {
@@ -367,7 +356,7 @@ const BookingPage = () => {
                         const isSelected = selectedSeats.includes(seat.seatNumber);
                         const isBooked = seat.isBooked;
 
-                        let seatClass = 'seat w-12 h-12 rounded flex items-center justify-center font-semibold text-sm cursor-pointer border-2';
+                        let seatClass = 'w-12 h-12 rounded flex items-center justify-center font-semibold text-sm cursor-pointer border-2 transition';
                         
                         if (isBooked) {
                           seatClass += ' bg-red-500 text-white border-red-600 cursor-not-allowed';
@@ -377,7 +366,6 @@ const BookingPage = () => {
                           seatClass += ' bg-green-500 text-white border-green-600 hover:bg-green-600';
                         }
 
-                        // Add aisle space after 2nd seat
                         const isAisle = seatIndex === 1;
 
                         return (
@@ -406,13 +394,12 @@ const BookingPage = () => {
 
           {/* Passenger Details & Booking Summary */}
           <div className="space-y-6">
-            {/* Passenger Details */}
             <div className="bg-white rounded-lg shadow-md p-6">
               <h3 className="text-xl font-bold text-gray-900 mb-4">Passenger Details</h3>
               <form onSubmit={handleBooking} className="space-y-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Full Name
+                    Full Name *
                   </label>
                   <input
                     type="text"
@@ -426,7 +413,7 @@ const BookingPage = () => {
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Age
+                    Age *
                   </label>
                   <input
                     type="number"
@@ -442,7 +429,7 @@ const BookingPage = () => {
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Gender
+                    Gender *
                   </label>
                   <select
                     name="gender"
@@ -459,7 +446,7 @@ const BookingPage = () => {
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Phone Number
+                    Phone Number *
                   </label>
                   <input
                     type="tel"
@@ -472,35 +459,35 @@ const BookingPage = () => {
                   />
                 </div>
 
-                {/* Payment Method Selection */}
+                {/* Payment Method */}
                 <div className="border-t pt-4">
                   <label className="block text-sm font-medium text-gray-700 mb-3">
-                    Payment Method
+                    Payment Method *
                   </label>
                   <div className="space-y-2">
-                    <label className="flex items-center p-3 border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50">
+                    <label className="flex items-center p-3 border-2 border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition">
                       <input
                         type="radio"
                         name="paymentMethod"
                         value="online"
                         checked={paymentMethod === 'online'}
                         onChange={(e) => setPaymentMethod(e.target.value)}
-                        className="w-4 h-4 text-primary-600 border-gray-300 focus:ring-primary-500"
+                        className="w-4 h-4 text-primary-600"
                       />
                       <div className="ml-3">
-                        <span className="font-medium text-gray-900">Pay Now (Online)</span>
-                        <p className="text-xs text-gray-600">Credit/Debit Card, UPI, Net Banking</p>
+                        <span className="font-medium text-gray-900">Pay Now (Recommended)</span>
+                        <p className="text-xs text-gray-600">Secure payment via Razorpay</p>
                       </div>
                     </label>
 
-                    <label className="flex items-center p-3 border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50">
+                    <label className="flex items-center p-3 border-2 border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition">
                       <input
                         type="radio"
                         name="paymentMethod"
                         value="cash"
                         checked={paymentMethod === 'cash'}
                         onChange={(e) => setPaymentMethod(e.target.value)}
-                        className="w-4 h-4 text-primary-600 border-gray-300 focus:ring-primary-500"
+                        className="w-4 h-4 text-primary-600"
                       />
                       <div className="ml-3">
                         <span className="font-medium text-gray-900">Pay Later (Cash)</span>
@@ -515,15 +502,9 @@ const BookingPage = () => {
                   <h4 className="font-semibold text-gray-900 mb-3">Booking Summary</h4>
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
-                      <span className="text-gray-600">Base Fare ({selectedSeats.length} seats)</span>
+                      <span className="text-gray-600">Seats ({selectedSeats.length})</span>
                       <span className="font-medium">₹{totalAmount}</span>
                     </div>
-                    {discount > 0 && (
-                      <div className="flex justify-between text-green-600">
-                        <span>Discount</span>
-                        <span className="font-medium">-₹{discount}</span>
-                      </div>
-                    )}
                     <div className="flex justify-between text-lg font-bold border-t pt-2">
                       <span>Total Amount</span>
                       <span className="text-primary-600">₹{finalAmount}</span>
@@ -542,6 +523,12 @@ const BookingPage = () => {
                       ? `Pay ₹${finalAmount}` 
                       : 'Confirm Booking'}
                 </button>
+
+                {paymentMethod === 'online' && (
+                  <p className="text-xs text-gray-500 text-center">
+                    🔒 Secure payment powered by Razorpay
+                  </p>
+                )}
               </form>
             </div>
           </div>

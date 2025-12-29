@@ -53,7 +53,7 @@ export const busAPI = {
   getBusById: (id) => api.get(`/buses/${id}`),
   getBusSeats: (id) => api.get(`/buses/${id}/seats`),
   getAllRoutes: () => api.get('/buses/routes/all'),
-  
+
   // Admin only
   createBus: (data) => api.post('/buses', data),
   updateBus: (id, data) => api.put(`/buses/${id}`, data),
@@ -67,7 +67,7 @@ export const bookingAPI = {
   getBookingById: (id) => api.get(`/bookings/${id}`),
   cancelBooking: (id, data) => api.put(`/bookings/${id}/cancel`, data),
   downloadTicket: (id) => api.get(`/bookings/${id}/download`, { responseType: 'blob' }),
-  
+
   // Admin only
   getAllBookings: (params) => api.get('/bookings/admin/all', { params }),
   getBookingStats: () => api.get('/bookings/admin/stats')
@@ -79,7 +79,6 @@ export const paymentAPI = {
   verifyPayment: (data) => api.post('/payment/verify', data),
   processRefund: (bookingId) => api.post(`/payment/refund/${bookingId}`)
 };
-
 // Review APIs
 export const reviewAPI = {
   createReview: (data) => api.post('/reviews', data),
@@ -88,7 +87,7 @@ export const reviewAPI = {
   canReviewBooking: (bookingId) => api.get(`/reviews/can-review/${bookingId}`),
   updateReview: (id, data) => api.put(`/reviews/${id}`, data),
   deleteReview: (id) => api.delete(`/reviews/${id}`),
-  
+
   // Admin only
   respondToReview: (id, data) => api.put(`/reviews/${id}/response`, data)
 };
@@ -98,7 +97,7 @@ export const offerAPI = {
   getActiveOffers: () => api.get('/offers'),
   validateOffer: (data) => api.post('/offers/validate', data),
   getOfferByCode: (code) => api.get(`/offers/${code}`),
-  
+
   // Admin only
   createOffer: (data) => api.post('/offers', data),
   getAllOffers: () => api.get('/offers/admin/all'),

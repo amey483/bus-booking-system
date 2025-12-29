@@ -1,21 +1,24 @@
-const Razorpay = require('razorpay');
+const axios = require('axios');
 const crypto = require('crypto');
 const Booking = require('../models/Booking');
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+console.log('🔧 Loading Payment Controller...');
+console.log('Environment variables:');
+console.log('  RAZORPAY_KEY_ID:', process.env.RAZORPAY_KEY_ID ? '✅ Set' : '❌ Missing');
+console.log('  RAZORPAY_KEY_SECRET:', process.env.RAZORPAY_KEY_SECRET ? '✅ Set' : '❌ Missing');
 
 // @desc    Create Razorpay order
 // @route   POST /api/payment/create-order
 // @access  Private
 exports.createOrder = async (req, res) => {
+  console.log('\n💳 ===== CREATE ORDER REQUEST =====');
+  
   try {
     const { amount, bookingId } = req.body;
 
-    // Validate amount
+    console.log('Request:', { amount, bookingId });
+
+    // Validate
     if (!amount || amount <= 0) {
       return res.status(400).json({
         success: false,
@@ -23,23 +26,81 @@ exports.createOrder = async (req, res) => {
       });
     }
 
-    const options = {
-      amount: amount * 100, // amount in smallest currency unit (paise)
+    // Check booking
+    const booking = await Booking.findById(bookingId);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    if (booking.user.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    // Generate receipt
+    const shortId = bookingId.toString().slice(-12);
+    const timestamp = Date.now().toString(36).toUpperCase();
+    const receipt = `BK${shortId}${timestamp}`.substring(0, 40);
+
+    // Order data
+    const orderData = {
+      amount: Math.round(amount * 100), // Paise
       currency: 'INR',
-      receipt: `booking_${bookingId}_${Date.now()}`,
+      receipt: receipt,
       notes: {
         bookingId: bookingId,
-        userId: req.user.id
+        userId: req.user.id,
+        bookingIdDisplay: booking.bookingId
       }
     };
 
-    const order = await razorpay.orders.create(options);
+    console.log('📋 Creating Razorpay order:', orderData);
+
+    // ✅ DIRECT API CALL using axios
+    const response = await axios.post(
+      'https://api.razorpay.com/v1/orders',
+      orderData,
+      {
+        auth: {
+          username: process.env.RAZORPAY_KEY_ID,
+          password: process.env.RAZORPAY_KEY_SECRET
+        },
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const order = response.data;
+    console.log('✅ Order created successfully:', order.id);
 
     res.status(200).json({
       success: true,
-      order
+      order,
+      razorpayKeyId: process.env.RAZORPAY_KEY_ID
     });
+
   } catch (error) {
+    console.error('\n❌ ===== PAYMENT ERROR =====');
+    console.error('Error:', error.response?.data || error.message);
+    
+    // Handle Razorpay API errors
+    if (error.response?.data?.error) {
+      const razorpayError = error.response.data.error;
+      console.error('Razorpay Error:', razorpayError);
+      
+      return res.status(error.response.status || 500).json({
+        success: false,
+        message: razorpayError.description || 'Payment order creation failed',
+        error: razorpayError.description
+      });
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to create payment order',
@@ -60,6 +121,19 @@ exports.verifyPayment = async (req, res) => {
       bookingId
     } = req.body;
 
+    console.log('🔍 Verifying payment:', {
+      razorpay_order_id,
+      razorpay_payment_id,
+      bookingId
+    });
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !bookingId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required payment details'
+      });
+    }
+
     // Create signature
     const sign = razorpay_order_id + '|' + razorpay_payment_id;
     const expectedSign = crypto
@@ -67,9 +141,10 @@ exports.verifyPayment = async (req, res) => {
       .update(sign.toString())
       .digest('hex');
 
+    console.log('Signature match:', razorpay_signature === expectedSign);
+
     // Verify signature
     if (razorpay_signature === expectedSign) {
-      // Update booking payment status
       const booking = await Booking.findById(bookingId);
       
       if (!booking) {
@@ -79,6 +154,14 @@ exports.verifyPayment = async (req, res) => {
         });
       }
 
+      if (booking.user.toString() !== req.user.id) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized'
+        });
+      }
+
+      // Update booking
       booking.paymentStatus = 'completed';
       booking.paymentMethod = 'razorpay';
       booking.paymentDetails = {
@@ -86,7 +169,22 @@ exports.verifyPayment = async (req, res) => {
         paymentId: razorpay_payment_id,
         signature: razorpay_signature
       };
+      booking.bookingStatus = 'confirmed';
       await booking.save();
+
+      console.log('✅ Payment verified and booking confirmed');
+
+      // Send email
+      try {
+        const { sendBookingConfirmation } = require('../utils/emailService');
+        const populatedBooking = await Booking.findById(booking._id)
+          .populate('user', 'name email phone')
+          .populate('bus', 'busName busNumber from to departureTime arrivalTime');
+        
+        await sendBookingConfirmation(populatedBooking, req.user);
+      } catch (emailError) {
+        console.error('Email error:', emailError);
+      }
 
       res.status(200).json({
         success: true,
@@ -94,10 +192,13 @@ exports.verifyPayment = async (req, res) => {
         booking
       });
     } else {
-      // Payment failed
+      // Failed verification
+      console.error('❌ Signature mismatch');
+      
       const booking = await Booking.findById(bookingId);
       if (booking) {
         booking.paymentStatus = 'failed';
+        booking.bookingStatus = 'cancelled';
         await booking.save();
       }
 
@@ -107,6 +208,7 @@ exports.verifyPayment = async (req, res) => {
       });
     }
   } catch (error) {
+    console.error('❌ Payment verification error:', error);
     res.status(500).json({
       success: false,
       message: 'Payment verification error',
@@ -129,7 +231,6 @@ exports.processRefund = async (req, res) => {
       });
     }
 
-    // Check if user owns the booking
     if (booking.user.toString() !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -137,7 +238,6 @@ exports.processRefund = async (req, res) => {
       });
     }
 
-    // Check if booking is cancelled and eligible for refund
     if (booking.bookingStatus !== 'cancelled') {
       return res.status(400).json({
         success: false,
@@ -152,20 +252,34 @@ exports.processRefund = async (req, res) => {
       });
     }
 
-    // Create refund
-    const refund = await razorpay.payments.refund(
-      booking.paymentDetails.paymentId,
+    console.log('💰 Processing refund...');
+
+    // Direct API call for refund
+    const refundData = {
+      amount: Math.round(booking.cancellation.refundAmount * 100),
+      speed: 'normal',
+      notes: {
+        bookingId: booking._id.toString(),
+        reason: 'Booking cancelled by user'
+      }
+    };
+
+    const response = await axios.post(
+      `https://api.razorpay.com/v1/payments/${booking.paymentDetails.paymentId}/refund`,
+      refundData,
       {
-        amount: booking.cancellation.refundAmount * 100, // amount in paise
-        speed: 'normal',
-        notes: {
-          bookingId: booking._id.toString(),
-          reason: 'Booking cancelled by user'
+        auth: {
+          username: process.env.RAZORPAY_KEY_ID,
+          password: process.env.RAZORPAY_KEY_SECRET
+        },
+        headers: {
+          'Content-Type': 'application/json'
         }
       }
     );
 
-    // Update refund status
+    const refund = response.data;
+
     booking.cancellation.refundStatus = 'processed';
     booking.cancellation.refundDetails = {
       refundId: refund.id,
@@ -174,16 +288,19 @@ exports.processRefund = async (req, res) => {
     };
     await booking.save();
 
+    console.log('✅ Refund processed:', refund.id);
+
     res.status(200).json({
       success: true,
       message: 'Refund processed successfully',
       refund
     });
   } catch (error) {
+    console.error('❌ Refund error:', error.response?.data || error.message);
     res.status(500).json({
       success: false,
       message: 'Refund processing failed',
-      error: error.message
+      error: error.response?.data?.error?.description || error.message
     });
   }
 };

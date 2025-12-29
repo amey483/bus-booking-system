@@ -8,6 +8,7 @@ const {
   updateBus,
   deleteBus,
   getBusSeats,
+  getBusSeatsForDate, // ✅ ADD THIS
   getAllRoutes
 } = require('../controllers/busController');
 const { protect, authorize } = require('../middleware/auth');
@@ -18,6 +19,7 @@ router.get('/search', searchBuses);
 router.get('/routes/all', getAllRoutes);
 router.get('/:id', getBusById);
 router.get('/:id/seats', getBusSeats);
+router.get('/:id/seats/:date', getBusSeatsForDate); // ✅ ADD THIS LINE - IMPORTANT: Must be AFTER /:id/seats
 
 // Protected routes - Admin only
 router.post('/', protect, authorize('admin'), createBus);

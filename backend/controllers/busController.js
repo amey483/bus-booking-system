@@ -1,11 +1,11 @@
 const Bus = require('../models/Bus');
+const Booking = require('../models/Booking'); // ✅ REQUIRED
 
 // @desc    Create new bus (Admin only)
 // @route   POST /api/buses
 // @access  Private/Admin
 exports.createBus = async (req, res) => {
   try {
-    // Check if bus number already exists
     const existingBus = await Bus.findOne({ busNumber: req.body.busNumber });
     if (existingBus) {
       return res.status(400).json({
@@ -38,14 +38,13 @@ exports.getAllBuses = async (req, res) => {
   try {
     const { from, to, date, busType, status } = req.query;
     
-    // Build query
     let query = {};
     
     if (from) query.from = new RegExp(from, 'i');
     if (to) query.to = new RegExp(to, 'i');
     if (busType) query.busType = busType;
     if (status) query.status = status;
-    else query.status = 'active'; // Default to active buses
+    else query.status = 'active';
 
     const buses = await Bus.find(query).sort({ departureTime: 1 });
 
@@ -209,6 +208,82 @@ exports.getBusSeats = async (req, res) => {
       seatLayout: bus.seatLayout
     });
   } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch seat information',
+      error: error.message
+    });
+  }
+};
+
+// ✅ NEW FUNCTION - Get seats for specific date
+// @desc    Get available seats for a bus on a specific date
+// @route   GET /api/buses/:id/seats/:date
+// @access  Public
+exports.getBusSeatsForDate = async (req, res) => {
+  try {
+    const { id, date } = req.params;
+    
+    console.log(`🔍 Fetching seats for bus ${id} on date ${date}`);
+    
+    const bus = await Bus.findById(id);
+
+    if (!bus) {
+      return res.status(404).json({
+        success: false,
+        message: 'Bus not found'
+      });
+    }
+
+    // Parse the date
+    const journeyDate = new Date(date);
+    const startOfDay = new Date(journeyDate.setHours(0, 0, 0, 0));
+    const endOfDay = new Date(journeyDate.setHours(23, 59, 59, 999));
+
+    console.log('Date range:', { startOfDay, endOfDay });
+
+    // Get confirmed bookings for this date
+    const bookingsForDate = await Booking.find({
+      bus: id,
+      journeyDate: {
+        $gte: startOfDay,
+        $lte: endOfDay
+      },
+      bookingStatus: 'confirmed'
+    });
+
+    console.log(`📋 Found ${bookingsForDate.length} confirmed bookings`);
+
+    // Collect booked seats
+    const bookedSeatsForDate = new Set();
+    bookingsForDate.forEach(booking => {
+      booking.seats.forEach(seat => bookedSeatsForDate.add(seat));
+    });
+
+    console.log(`🪑 Booked seats:`, Array.from(bookedSeatsForDate));
+
+    // Create date-specific seat layout
+    const dateSpecificSeatLayout = bus.seatLayout.map(seat => ({
+      seatNumber: seat.seatNumber,
+      isBooked: bookedSeatsForDate.has(seat.seatNumber),
+      bookedBy: bookedSeatsForDate.has(seat.seatNumber) ? 'booked' : null
+    }));
+
+    const availableSeatsCount = dateSpecificSeatLayout.filter(s => !s.isBooked).length;
+
+    console.log(`✅ Available: ${availableSeatsCount}/${bus.totalSeats}`);
+
+    res.status(200).json({
+      success: true,
+      busName: bus.busName,
+      totalSeats: bus.totalSeats,
+      availableSeats: availableSeatsCount,
+      seatLayout: dateSpecificSeatLayout,
+      journeyDate: date,
+      bookedSeatsCount: bookedSeatsForDate.size
+    });
+  } catch (error) {
+    console.error('❌ Error fetching date-specific seats:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch seat information',

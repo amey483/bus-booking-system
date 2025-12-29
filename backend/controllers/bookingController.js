@@ -18,6 +18,14 @@ exports.createBooking = async (req, res) => {
       paymentMethod
     } = req.body;
 
+    console.log('📝 Booking request received:', {
+      busId,
+      passengerDetails,
+      seats,
+      journeyDate,
+      paymentMethod
+    });
+
     // Validate required fields
     if (!busId || !passengerDetails || !seats || !journeyDate || !boardingPoint || !droppingPoint) {
       return res.status(400).json({
@@ -29,11 +37,14 @@ exports.createBooking = async (req, res) => {
     // Check if bus exists
     const bus = await Bus.findById(busId);
     if (!bus) {
+      console.error('❌ Bus not found:', busId);
       return res.status(404).json({
         success: false,
         message: 'Bus not found'
       });
     }
+
+    console.log('✅ Bus found:', bus.busName);
 
     // Check if bus is active
     if (bus.status !== 'active') {
@@ -51,35 +62,45 @@ exports.createBooking = async (req, res) => {
       });
     }
 
-    // Check if seats are available
-    for (let seatNumber of seats) {
-      const seat = bus.seatLayout.find(s => s.seatNumber === seatNumber);
-      
-      if (!seat) {
-        return res.status(400).json({
-          success: false,
-          message: `Seat ${seatNumber} does not exist. Available seats: ${bus.seatLayout.map(s => s.seatNumber).join(', ')}`
-        });
-      }
+    console.log('🪑 Checking seat availability for:', seats);
 
-      if (seat.isBooked) {
-        return res.status(400).json({
-          success: false,
-          message: `Seat ${seatNumber} is already booked`
-        });
-      }
+    // ✅ NEW: Check if seats are available for this specific date
+    const journeyDateObj = new Date(journeyDate);
+    const startOfDay = new Date(journeyDateObj.setHours(0, 0, 0, 0));
+    const endOfDay = new Date(journeyDateObj.setHours(23, 59, 59, 999));
+
+    const existingBookings = await Booking.find({
+      bus: busId,
+      journeyDate: {
+        $gte: startOfDay,
+        $lte: endOfDay
+      },
+      bookingStatus: 'confirmed',
+      seats: { $in: seats }
+    });
+
+    if (existingBookings.length > 0) {
+      const bookedSeats = existingBookings.flatMap(b => b.seats).filter(s => seats.includes(s));
+      return res.status(400).json({
+        success: false,
+        message: `Seats ${bookedSeats.join(', ')} are already booked for this date`
+      });
     }
+
+    console.log('✅ All seats are available for this date');
 
     // Calculate total amount
     const totalAmount = bus.price * seats.length;
 
-    // Generate booking ID manually to ensure it's created
+    // Generate booking ID
     const timestamp = Date.now().toString(36).toUpperCase();
     const randomStr = Math.random().toString(36).substr(2, 5).toUpperCase();
     const bookingId = `BKG${timestamp}${randomStr}`;
 
-    // Create booking
-    const booking = await Booking.create({
+    console.log('🎫 Generated Booking ID:', bookingId);
+
+    // Create booking data
+    const bookingData = {
       bookingId,
       user: req.user.id,
       bus: busId,
@@ -90,46 +111,130 @@ exports.createBooking = async (req, res) => {
       droppingPoint,
       totalAmount,
       paymentMethod: paymentMethod || 'cash',
-      paymentStatus: paymentMethod === 'cash' ? 'pending' : 'completed'
-    });
+      paymentStatus: 'pending',
+      bookingStatus: 'confirmed'
+    };
 
-    // Update bus seats
-    for (let seatNumber of seats) {
-      const seatIndex = bus.seatLayout.findIndex(s => s.seatNumber === seatNumber);
-      bus.seatLayout[seatIndex].isBooked = true;
-      bus.seatLayout[seatIndex].bookedBy = req.user.id;
-    }
-    
-    bus.updateAvailableSeats();
-    await bus.save();
+    console.log('💾 Creating booking with data:', bookingData);
+
+    // Create booking
+    const booking = await Booking.create(bookingData);
+    console.log('✅ Booking created successfully:', booking._id);
+
+    // ✅ NO SEAT UPDATES NEEDED - Seats are calculated dynamically from bookings
 
     // Populate booking details
     const populatedBooking = await Booking.findById(booking._id)
       .populate('user', 'name email phone')
       .populate('bus', 'busName busNumber from to departureTime arrivalTime');
 
-    // Send booking confirmation email
-    try {
-      console.log('Sending confirmation email to:', req.user.email);
-      await sendBookingConfirmation(populatedBooking, req.user);
-      console.log('✅ Confirmation email sent successfully');
-    } catch (emailError) {
-      console.error('Failed to send confirmation email:', emailError.message);
-      // Don't fail the booking if email fails
+    // Send confirmation email only for cash bookings
+    if (paymentMethod === 'cash') {
+      try {
+        await sendBookingConfirmation(populatedBooking, req.user);
+        console.log('✅ Confirmation email sent');
+      } catch (emailError) {
+        console.error('⚠️ Failed to send confirmation email:', emailError.message);
+      }
     }
+
+    console.log('🎉 Booking process completed successfully');
 
     res.status(201).json({
       success: true,
-      message: 'Booking created successfully',
+      message: paymentMethod === 'online' 
+        ? 'Booking created. Please complete payment.' 
+        : 'Booking confirmed successfully',
       booking: populatedBooking
     });
   } catch (error) {
-    console.error('Booking creation error:', error);
+    console.error('❌ Booking creation error:', error);
+    console.error('Error stack:', error.stack);
     res.status(500).json({
       success: false,
       message: 'Booking failed',
       error: error.message,
       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+// @desc    Confirm booking after payment success
+// @route   POST /api/bookings/:id/confirm
+// @access  Private
+exports.confirmBooking = async (req, res) => {
+  try {
+    const booking = await Booking.findById(req.params.id).populate('bus');
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    // Check if user owns the booking
+    if (booking.user.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    // Check if already confirmed
+    if (booking.paymentStatus === 'completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'Booking already confirmed'
+      });
+    }
+
+    // Update bus seats
+    const bus = booking.bus;
+    for (let seatNumber of booking.seats) {
+      const seatIndex = bus.seatLayout.findIndex(s => s.seatNumber === seatNumber);
+      if (seatIndex !== -1) {
+        // Double-check seat is still available
+        if (bus.seatLayout[seatIndex].isBooked) {
+          return res.status(400).json({
+            success: false,
+            message: `Seat ${seatNumber} is no longer available`
+          });
+        }
+        bus.seatLayout[seatIndex].isBooked = true;
+        bus.seatLayout[seatIndex].bookedBy = req.user.id;
+      }
+    }
+    bus.updateAvailableSeats();
+    await bus.save();
+
+    // Update booking status
+    booking.paymentStatus = 'completed';
+    booking.bookingStatus = 'confirmed';
+    await booking.save();
+
+    // Send confirmation email
+    const populatedBooking = await Booking.findById(booking._id)
+      .populate('user', 'name email phone')
+      .populate('bus', 'busName busNumber from to departureTime arrivalTime');
+
+    try {
+      await sendBookingConfirmation(populatedBooking, req.user);
+    } catch (emailError) {
+      console.error('Failed to send confirmation email:', emailError.message);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Booking confirmed successfully',
+      booking: populatedBooking
+    });
+  } catch (error) {
+    console.error('Booking confirmation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to confirm booking',
+      error: error.message
     });
   }
 };
@@ -260,9 +365,7 @@ exports.cancelBooking = async (req, res) => {
 
     // Send cancellation email
     try {
-      console.log('Sending cancellation email to:', req.user.email);
       await sendCancellationEmail(updatedBooking, req.user);
-      console.log('✅ Cancellation email sent successfully');
     } catch (emailError) {
       console.error('Failed to send cancellation email:', emailError.message);
     }
@@ -346,14 +449,11 @@ exports.getBookingStats = async (req, res) => {
       totalRefunds: refunds.length > 0 ? refunds[0].total : 0
     };
 
-    console.log('Admin stats:', stats); // Debug log
-
     res.status(200).json({
       success: true,
       stats
     });
   } catch (error) {
-    console.error('Stats error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch statistics',
@@ -394,19 +494,14 @@ exports.downloadTicket = async (req, res) => {
       });
     }
 
-    console.log('Generating PDF for booking:', booking.bookingId);
-
-    // Check if PDF service exists
     let pdfPath;
     try {
-      const { generateTicketPDF } = require('../utils/pdfService');
       pdfPath = await generateTicketPDF(booking);
-      console.log('PDF generated at:', pdfPath);
     } catch (pdfError) {
       console.error('PDF generation error:', pdfError);
       return res.status(500).json({
         success: false,
-        message: 'PDF generation failed. PDFKit may not be installed.',
+        message: 'PDF generation failed',
         error: pdfError.message
       });
     }
@@ -434,10 +529,6 @@ exports.downloadTicket = async (req, res) => {
             message: 'Failed to send ticket file'
           });
         }
-      } else {
-        console.log('✅ PDF sent successfully');
-        // Optional: Delete file after sending
-        // fs.unlinkSync(pdfPath);
       }
     });
   } catch (error) {

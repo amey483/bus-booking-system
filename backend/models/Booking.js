@@ -69,7 +69,7 @@ const bookingSchema = new mongoose.Schema({
   },
   paymentMethod: {
     type: String,
-    enum: ['cash', 'card', 'upi', 'netbanking', 'wallet'],
+    enum: ['cash', 'card', 'upi', 'netbanking', 'wallet', 'razorpay', 'online'], // ✅ FIXED: Added 'online' and 'razorpay'
     default: 'cash'
   },
   bookingStatus: {
@@ -118,7 +118,7 @@ const bookingSchema = new mongoose.Schema({
 
 // Generate unique booking ID before saving
 bookingSchema.pre('save', function(next) {
-  if (this.isNew) {
+  if (this.isNew && !this.bookingId) {
     const timestamp = Date.now().toString(36);
     const randomStr = Math.random().toString(36).substr(2, 5).toUpperCase();
     this.bookingId = `BKG${timestamp}${randomStr}`;
